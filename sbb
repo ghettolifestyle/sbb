@@ -1,0 +1,263 @@
+#!/bin/bash
+set -euo pipefail
+
+# default to best editor
+EDITOR="vim"
+# set this if you plan on using backblaze for backup purposes
+# BACKBLAZE_REMOTE=""
+WORKING_DIR="/repo/root"
+BACKUP_DIR="/your/backup/directory"
+DRAFT_DIR="${WORKING_DIR}/drafts"
+TEMPLATE_DIR="{$WORKING_DIR}/templates/"
+OUT_DIR="${WORKING_DIR}/out"
+POST_DIR="${OUT_DIR}/p"
+REMOTE_ROOT_DIR="/var/static"
+
+SSH_USER="user"
+SSH_REMOTE_HOST="localhost"
+# leave empty if default ssh port (22) is used
+SSH_PORT=""
+
+DATE=$(date)
+
+edit_post() {
+  posts=( $(ls -t $POST_DIR) )
+
+  c=0
+  for i in "${posts[@]}"; do
+    echo "[$c] $i"
+    c=$((c+1))
+  done
+
+  echo "index of post to edit> "
+  read selection
+  mv "$POST_DIR/${posts[$selection]}" "$DRAFT_DIR/${posts[$selection]}"
+
+  $EDITOR "$DRAFT_DIR/${posts[$selection]}/in.md"
+}
+
+remove_post() {
+  posts=( $(ls -t $POST_DIR) )
+
+  c=0
+  for i in "${posts[@]}"; do
+    echo "[$c] $i"
+    c=$((c+1))
+  done
+
+  echo "index of post to remove> "
+  read selection
+
+  rm -r "$POST_DIR/${posts[$selection]}"
+} 
+
+create_post() {
+  echo "title of new post> "
+  read title
+
+  post_dir="$DRAFT_DIR/$(echo $title | sed s'/ /_/g' | sed s'/\W//g')"
+  new_post="$post_dir/in.md"
+
+  mkdir -p $post_dir
+  echo "# $title" > $new_post
+  echo "<p class=\"date\">$(date +%m/%d/%y)</p>" >> $new_post
+  echo >> $new_post
+  echo >> $new_post
+
+  $EDITOR "$new_post"
+
+  echo "new draft created at $post_dir"
+}
+
+backup_post() {
+  if [ -z "$BACKUP_DIR" ]; then
+    mkdir -p $BACKUP_DIR
+  fi
+
+  cp -r $1 "$BACKUP_DIR/"
+}
+
+build_index() {
+  posts=( $(ls -t $POST_DIR) )
+  index_html="$OUT_DIR/index.html"
+
+  cat "$TEMPLATE_DIR/head_index.html" > $index_html
+
+  echo "<table id=\"posts\">" >> $index_html
+  echo "<tbody>" >> $index_html
+
+  for i in "${posts[@]}"; do
+    date=$(cat "$POST_DIR/$i/in.md" | head -n 2 | tail -n 1 | egrep -o '../../..')
+    title=$(cat "$POST_DIR/$i/in.md" | head -n 1 | sed s'/\W //')
+
+    echo "<tr><td><span class=\"date\">$(date -d $date "+%b %y" | tr '[:upper:]' '[:lower:]')</span></td><td><a href=\"p/$i\">$title</a></td></tr>" >> $index_html
+  done
+
+  echo "</tbody>" >> $index_html
+  echo "</table>" >> $index_html
+
+  # write link list
+  echo "<ul id=\"links\">" >> $index_html
+  echo "<li><a href=\"https://git.sr.ht/~km80/\">git</a></li> / " >> $index_html
+  echo "<li><a href=\"https://www.linkedin.com/in/kevin-mai-324b86171/\">linkedin</a></li>" >> $index_html
+  echo "</ul>" >> $index_html
+
+  cat "$TEMPLATE_DIR/foot.html" >> $index_html
+}
+
+assemble_post() {
+  index_html="$1/index.html"
+  post_html="$1/post.html"
+
+  if [ -f "$index_html" ]; then
+    rm $index_html
+  fi
+
+  pandoc -f markdown -t html -o $post_html "$1/in.md"
+
+  cat "$TEMPLATE_DIR/head_post.html" > $index_html
+  cat $post_html >> $index_html
+  rm $post_html
+
+  echo "<hr>" >> $index_html
+  echo "<p class=\"quote\"><span class=\"quote-text\">\"One must, in one's life, make a choice between boredom and suffering.\"</span> - <span class=\"quote-source\">Madame de Staël</span></p>" >> $index_html
+
+  cat "$TEMPLATE_DIR/foot.html" >> $index_html
+}
+
+publish_posts() {
+  set +e
+  posts=( $(\ls -tr $DRAFT_DIR) )
+  images=( $(find $DRAFT_DIR -type f -exec ls {} \; | egrep ".*(png|jpeg|jpg)") )
+
+  if ! [ "${#images[@]}" -eq 0 ]; then
+    echo "found images:"
+    for i in "${images[@]}"; do
+      if [[ -n $(echo $i | grep "small") ]]; then
+        size=320
+      elif [[ -n $(echo $i | grep "medium") ]]; then
+        size=640
+      elif [[ -n $(echo $i | grep "large") ]]; then
+        size=1024
+      else
+        size=640
+      fi
+    done
+
+    if [ "$size" -gt "$(identify -format \"%w\" $i)" ]; then
+      convert $i -resize $size > $i
+    fi
+  fi
+
+  for post in "${posts[@]}"; do
+    timestamp=$(cat "$DRAFT_DIR/$post/in.md" | head -n 2 | tail -n 1 | egrep -o "../../..")
+    assemble_post "$DRAFT_DIR/$post"
+    backup_post "$DRAFT_DIR/$post"
+
+    touch -m -d $timestamp "$DRAFT_DIR/$post" $DRAFT_DIR/$post/*
+    mv "$DRAFT_DIR/$post" $POST_DIR/
+  done
+
+  build_index
+  set -e
+}
+
+fetch_posts() {
+  rm -r $POST_DIR/*
+
+  if ! [ $SSH_PORT == 22 ]; then
+    scp -P "$SSH_PORT" -r "$USER"@"$SSH_REMOTE_HOST":"$REMOTE_ROOT_DIR"/p/* "$DRAFT_DIR"
+  else
+    scp -r "$USER"@"$SSH_REMOTE_HOST":"$REMOTE_ROOT_DIR"/p/* "$DRAFT_DIR"
+  fi
+}
+
+sync_posts() {
+  set -euo pipefail
+
+  if ! [ -z $SSH_PORT ]; then
+    rsync -e "ssh -p $SSH_PORT" -qrzhP $OUT_DIR/* $SSH_USER@$SSH_REMOTE_HOST:$REMOTE_ROOT_DIR
+  else
+    rsync -qrzhP $OUT_DIR/* $SSH_USER@$SSH_REMOTE_HOST:$REMOTE_ROOT_DIR
+  fi
+
+  echo -n "sync to backblaze? (y/N) "
+  read $backblaze_sync
+
+  case "${backblaze_sync}" in
+    "y")
+      backblaze_posts
+      ;;
+    *)
+      ;;
+  esac
+
+  set +euo pipefail
+}
+
+backblaze_posts() {
+  echo "syncing to backblaze"
+  rclone sync -i "{$OUT_DIR}" "${BACKBLAZE_REMOTE}":blog-backup/$(date +%s)
+}
+
+print_usage() {
+  echo "usage: ./sbb {"
+  echo "  n(ew) [title] - create new draft"
+  echo "  p(ublish) - publish all posts to the blog"
+  echo "  e(dit) - move a post back to draft folder for editing"
+  echo "  f(etch) - move all posts back to draft folder"
+  echo "  r(emove) - permanently remove a published post"
+  echo "  s(ync) - sync out directory to remote server"
+  echo "  b(ackblaze) - backup out directory to backblaze remote"
+  echo "  m(akeover) - fetch, publish and sync entire blog"
+  echo "}"
+}
+
+if ! [ -d $DRAFT_DIR ]; then
+  mkdir -p $DRAFT_DIR
+fi
+
+if ! [ -d $POST_DIR ]; then
+  mkdir -p $POST_DIR
+fi
+
+if ! [ -d $BACKUP_DIR ]; then
+  mkdir -p $BACKUP_DIR
+fi
+
+# runtime
+if [ $# -eq 0 ]; then
+  print_usage
+  exit 1
+fi
+
+op=$1
+case $op in
+  "n")
+    create_post
+    ;;
+  "r")
+    remove_post
+    ;;
+  "e")
+    edit_post
+    ;;
+  "p")
+    publish_posts
+    ;;
+  "f")
+    fetch_posts
+    ;;
+  "s")
+    sync_posts
+    ;;
+  "m")
+    fetch_posts
+    publish_posts
+    sync_posts
+    ;;
+  *)
+    print_usage
+esac
+
+build_index
